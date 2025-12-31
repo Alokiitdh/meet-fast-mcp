@@ -29,12 +29,12 @@ def get_calendar_service():
         else:
             # Uses 'credentials.json' downloaded from Google Cloud Console
             flow = InstalledAppFlow.from_client_secrets_file(
-                "credentials.json", SCOPES
+                "gmeet/auth/credentials.json", SCOPES
             )
             creds = flow.run_local_server(port=0)
 
         # Save the credentials for future runs
-        with open("token.json", "w", encoding="utf-8") as token:
+        with open("gmeet/auth/token.json", "w", encoding="utf-8") as token:
             token.write(creds.to_json())
 
     service = build("calendar", "v3", credentials=creds)
