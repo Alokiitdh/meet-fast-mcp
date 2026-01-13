@@ -324,3 +324,183 @@ def delete_meeting(event_id: str) -> Dict[str, Any]:
 if __name__ == "__main__":
     # 
     mcp.run(transport="http", host="127.0.0.1", port= 8001)
+
+
+def _get_all_blocking_calendars(service) -> List[str]:
+    """
+    Returns calendar IDs that should block availability.
+    Skips calendars marked as 'free' or 'transparent'.
+    """
+    calendars = []
+    page_token = None
+
+    while True:
+        resp = (
+            service.calendarList()
+            .list(pageToken=page_token)
+            .execute()
+        )
+
+        for cal in resp.get("items", []):
+            # Only calendars that actually block time
+            if cal.get("selected", True) and cal.get("accessRole") != "reader":
+                calendars.append(cal["id"])
+
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    return calendars
+    
+# ---------- TOOL 6: freebusy ----------
+
+@mcp.tool(name="freebusy")
+def freebusy(
+    time_min_iso: str,
+    time_max_iso: str,
+    include_all_calendars: bool = True,
+    timezone_str: str = "UTC",
+) -> Dict[str, List[Dict[str, str]]]:
+    """
+    Query Google Calendar FreeBusy API to get all busy time ranges,
+    including Out of Office, Focus Time, and secondary calendars.
+
+    Args:
+        time_min_iso: Start of time window (RFC3339 UTC).
+        time_max_iso: End of time window (RFC3339 UTC).
+        include_all_calendars: If true, includes all blocking calendars.
+        timezone_str: Timezone for response (default: UTC).
+
+    Returns:
+        {
+          "<calendar_id>": [
+            {"start": "...", "end": "..."}
+          ]
+        }
+    """
+    try:
+        service = get_calendar_service()
+
+        if include_all_calendars:
+            calendar_ids = _get_all_blocking_calendars(service)
+        else:
+            calendar_ids = [DEFAULT_CALENDAR_ID]
+
+        body = {
+            "timeMin": time_min_iso,
+            "timeMax": time_max_iso,
+            "timeZone": timezone_str,
+            "items": [{"id": cal_id} for cal_id in calendar_ids],
+        }
+
+        response = service.freebusy().query(body=body).execute()
+
+        busy_map: Dict[str, List[Dict[str, str]]] = {}
+
+        for cal_id, data in response.get("calendars", {}).items():
+            busy_map[cal_id] = data.get("busy", [])
+
+        return busy_map
+
+
+    except Exception as e:  # noqa: BLE001
+        raise ToolError(f"Failed to query freebusy: {e}")
+
+
+# ---------- TOOL 7: find-best-meeting-time ----------
+
+@mcp.tool(name="find-best-meeting-time")
+def find_best_meeting_time(
+    duration_minutes: int,
+    time_min_iso: str,
+    time_max_iso: str,
+    calendar_ids: Optional[List[str]] = None,
+    timezone_str: str = "UTC"
+) -> List[str]:
+    """
+    Find available meeting slots that accommodate the requested duration.
+    
+    Args:
+        duration_minutes: Length of the meeting in minutes.
+        time_min_iso: Start of search window (RFC3339).
+        time_max_iso: End of search window (RFC3339).
+        calendar_ids: List of calendar IDs to check for conflicts (defaults to primary + blocking).
+        timezone_str: Timezone for input/output interpretation (default: UTC).
+        
+    Returns:
+        List of available start times (RFC3339 strings) for the meeting.
+    """
+    try:
+        service = get_calendar_service()
+        
+        # 1. Determine calendars to check
+        if calendar_ids is None:
+             calendar_ids = _get_all_blocking_calendars(service)
+             if DEFAULT_CALENDAR_ID not in calendar_ids:
+                 calendar_ids.append(DEFAULT_CALENDAR_ID)
+
+        # 2. Query FreeBusy
+        body = {
+            "timeMin": time_min_iso,
+            "timeMax": time_max_iso,
+            "timeZone": timezone_str,
+            "items": [{"id": cal_id} for cal_id in calendar_ids],
+        }
+        resp = service.freebusy().query(body=body).execute()
+        
+        # 3. Parse and merge busy intervals
+        busy_intervals = []
+        for cal_data in resp.get("calendars", {}).values():
+            for error in cal_data.get("errors", []):
+                # Log or ignore errors? For now ignore.
+                pass
+            for busy in cal_data.get("busy", []):
+                # Parse to datetime
+                start = datetime.fromisoformat(busy["start"].replace("Z", "+00:00"))
+                end = datetime.fromisoformat(busy["end"].replace("Z", "+00:00"))
+                busy_intervals.append((start, end))
+                
+        busy_intervals.sort(key=lambda x: x[0])
+        
+        merged = []
+        if busy_intervals:
+            curr_start, curr_end = busy_intervals[0]
+            for next_start, next_end in busy_intervals[1:]:
+                if next_start < curr_end:
+                    curr_end = max(curr_end, next_end)
+                else:
+                    merged.append((curr_start, curr_end))
+                    curr_start, curr_end = next_start, next_end
+            merged.append((curr_start, curr_end))
+            
+        # 4. Find gaps
+        search_start = datetime.fromisoformat(time_min_iso.replace("Z", "+00:00"))
+        search_end = datetime.fromisoformat(time_max_iso.replace("Z", "+00:00"))
+        
+        available_slots = []
+        current_time = search_start
+        
+        for busy_start, busy_end in merged:
+            if busy_end <= current_time:
+                continue
+            
+            if busy_start > current_time:
+                # Gap found
+                temp_time = current_time
+                while temp_time + timedelta(minutes=duration_minutes) <= busy_start:
+                    available_slots.append(temp_time.isoformat())
+                    temp_time += timedelta(minutes=15)
+            
+            current_time = max(current_time, busy_end)
+            
+        # Check final gap
+        if current_time < search_end:
+            temp_time = current_time
+            while temp_time + timedelta(minutes=duration_minutes) <= search_end:
+                available_slots.append(temp_time.isoformat())
+                temp_time += timedelta(minutes=15)
+                
+        return available_slots
+
+    except Exception as e:
+        raise ToolError(f"Failed to find meeting slots: {e}")
